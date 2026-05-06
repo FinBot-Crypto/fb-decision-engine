@@ -32,12 +32,12 @@ class DecisionEngine:
         logger.info(f"NATS conectado: {NATS_URL}")
 
     def compute_rsi(self, closes):
+        import pandas as pd
         delta = np.diff(closes)
         gain = np.maximum(delta, 0)
         loss = -np.minimum(delta, 0)
         avg_gain = pd.Series(gain).rolling(RSI_PERIOD).mean().values
         avg_loss = pd.Series(loss).rolling(RSI_PERIOD).mean().values
-        import pandas as pd
         rsi = 100 - 100 / (1 + avg_gain / (avg_loss + 1e-10))
         return float(rsi[-1])
 
