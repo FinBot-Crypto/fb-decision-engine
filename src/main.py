@@ -20,6 +20,7 @@ MAX_RSI_ENTRY = float(os.getenv("MAX_RSI_ENTRY", "38"))
 SHORT_MIN_SCORE = float(os.getenv("SHORT_MIN_SCORE", "0.85"))
 SHORT_MIN_RSI = float(os.getenv("SHORT_MIN_RSI", "65"))
 RSI_PERIOD = 56
+BTC_SMA_PERIOD = int(os.getenv("BTC_SMA_PERIOD", "50"))
 
 
 class DecisionEngine:
@@ -54,10 +55,28 @@ class DecisionEngine:
             logger.error(f"Erro RSI {symbol}: {e}")
             return None
 
+    async def fetch_btc_trend(self):
+        try:
+            ohlcv = self.exchange.fetch_ohlcv("BTC/USDT", "1h", limit=BTC_SMA_PERIOD + 10)
+            if not ohlcv or len(ohlcv) < BTC_SMA_PERIOD:
+                return "neutral"
+            closes = [c[4] for c in ohlcv]
+            sma = sum(closes[-BTC_SMA_PERIOD:]) / BTC_SMA_PERIOD
+            current = closes[-1]
+            if current > sma * 1.01:
+                return "bull"
+            elif current < sma * 0.99:
+                return "bear"
+            return "neutral"
+        except Exception as e:
+            logger.error(f"Erro BTC trend: {e}")
+            return "neutral"
+
     async def process_evaluations(self, msg):
         try:
             evaluations = json.loads(msg.data.decode())
-            logger.info(f"Analisando {len(evaluations)} avaliações")
+            btc_trend = await self.fetch_btc_trend()
+            logger.info(f"Analisando {len(evaluations)} avaliações [BTC: {btc_trend}]")
             opportunities = []
 
             for ev in evaluations:
@@ -68,6 +87,12 @@ class DecisionEngine:
                 for strat in strategies:
                     score = strat["score"]
                     direction = strat.get("direction", "LONG")
+
+                    # Filtro de regime: BTC trend bloqueia direção contrária
+                    if btc_trend == "bull" and direction == "SHORT":
+                        continue
+                    if btc_trend == "bear" and direction == "LONG":
+                        continue
 
                     if direction == "SHORT":
                         if score < SHORT_MIN_SCORE:
