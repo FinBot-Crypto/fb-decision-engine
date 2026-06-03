@@ -20,7 +20,7 @@ MAX_RSI_ENTRY = float(os.getenv("MAX_RSI_ENTRY", "38"))
 SHORT_MIN_SCORE = float(os.getenv("SHORT_MIN_SCORE", "0.85"))
 SHORT_MIN_RSI = float(os.getenv("SHORT_MIN_RSI", "65"))
 RSI_PERIOD = 56
-BTC_SMA_PERIOD = int(os.getenv("BTC_SMA_PERIOD", "50"))
+BTC_SMA_PERIOD = int(os.getenv("BTC_SMA_PERIOD", "12"))
 
 
 class DecisionEngine:
