@@ -17,7 +17,9 @@ logger = logging.getLogger("fb-decision-engine")
 NATS_URL = os.getenv("NATS_URL", "nats://crypto-nats:4222")
 MIN_CONFIDENCE_SCORE = float(os.getenv("MIN_CONFIDENCE_SCORE", "0.65"))
 MAX_RSI_ENTRY = float(os.getenv("MAX_RSI_ENTRY", "38"))
-RSI_PERIOD = 56  # 14h em 15m
+SHORT_MIN_SCORE = float(os.getenv("SHORT_MIN_SCORE", "0.85"))
+SHORT_MIN_RSI = float(os.getenv("SHORT_MIN_RSI", "65"))
+RSI_PERIOD = 56
 
 
 class DecisionEngine:
@@ -65,30 +67,54 @@ class DecisionEngine:
 
                 for strat in strategies:
                     score = strat["score"]
-                    strategy_name = strat["name"]
+                    direction = strat.get("direction", "LONG")
 
-                    if score < MIN_CONFIDENCE_SCORE:
-                        continue
+                    if direction == "SHORT":
+                        if score < SHORT_MIN_SCORE:
+                            continue
 
-                    rsi = await self.fetch_rsi(symbol)
-                    if rsi is None:
-                        logger.warning(f"  {symbol}: sem dados RSI")
-                        continue
+                        rsi = await self.fetch_rsi(symbol)
+                        if rsi is None:
+                            logger.warning(f"  {symbol}: sem dados RSI para SHORT")
+                            continue
 
-                    if rsi >= MAX_RSI_ENTRY:
-                        logger.info(f"  {symbol}: score={score:.4f} ok, mas RSI={rsi:.1f} >= {MAX_RSI_ENTRY} → ignora")
-                        continue
+                        if rsi < SHORT_MIN_RSI:
+                            logger.info(f"  {symbol}: short_score={score:.4f} ok, mas RSI={rsi:.1f} < {SHORT_MIN_RSI} → ignora")
+                            continue
 
-                    logger.info(f"  {symbol}: SIGNAL LONG → score={score:.4f} RSI={rsi:.1f} < {MAX_RSI_ENTRY}")
-                    opportunities.append({
-                        "symbol": symbol,
-                        "tier": tier,
-                        "strategy": strategy_name,
-                        "score": score,
-                        "rsi": round(rsi, 1),
-                        "direction": "LONG",
-                        "timestamp": ev.get("timestamp", ""),
-                    })
+                        logger.info(f"  {symbol}: SIGNAL SHORT → score={score:.4f} RSI={rsi:.1f} >= {SHORT_MIN_RSI}")
+                        opportunities.append({
+                            "symbol": symbol,
+                            "tier": tier,
+                            "strategy": strat["name"],
+                            "score": score,
+                            "rsi": round(rsi, 1),
+                            "direction": "SHORT",
+                            "timestamp": ev.get("timestamp", ""),
+                        })
+                    else:
+                        if score < MIN_CONFIDENCE_SCORE:
+                            continue
+
+                        rsi = await self.fetch_rsi(symbol)
+                        if rsi is None:
+                            logger.warning(f"  {symbol}: sem dados RSI")
+                            continue
+
+                        if rsi >= MAX_RSI_ENTRY:
+                            logger.info(f"  {symbol}: score={score:.4f} ok, mas RSI={rsi:.1f} >= {MAX_RSI_ENTRY} → ignora")
+                            continue
+
+                        logger.info(f"  {symbol}: SIGNAL LONG → score={score:.4f} RSI={rsi:.1f} < {MAX_RSI_ENTRY}")
+                        opportunities.append({
+                            "symbol": symbol,
+                            "tier": tier,
+                            "strategy": strat["name"],
+                            "score": score,
+                            "rsi": round(rsi, 1),
+                            "direction": "LONG",
+                            "timestamp": ev.get("timestamp", ""),
+                        })
 
             if opportunities:
                 payload = json.dumps(opportunities).encode()
