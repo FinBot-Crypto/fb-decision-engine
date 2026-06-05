@@ -8,13 +8,14 @@ Fluxo:
     → RSI < MAX_RSI_ENTRY?
     → publica trade.opportunity
 """
-import asyncio, logging, os, json, numpy as np, ccxt, nats
+import asyncio, logging, os, json, numpy as np, ccxt, nats, psycopg2
 from nats.js.api import ConsumerConfig
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("fb-decision-engine")
 
 NATS_URL = os.getenv("NATS_URL", "nats://crypto-nats:4222")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://crypto_admin:ZNG5z43LaSrk7FEmwu6CPtRUB2IVKdvY@crypto-postgres:5432/crypto_bot")
 MIN_CONFIDENCE_SCORE = float(os.getenv("MIN_CONFIDENCE_SCORE", "0.65"))
 MAX_RSI_ENTRY = float(os.getenv("MAX_RSI_ENTRY", "38"))
 SHORT_MIN_SCORE = float(os.getenv("SHORT_MIN_SCORE", "0.85"))
@@ -28,6 +29,89 @@ class DecisionEngine:
         self.nc = None
         self.js = None
         self.exchange = ccxt.binance({"enableRateLimit": True})
+        self.db_url = DATABASE_URL
+        self.db_conn = None
+        self.db_cursor = None
+
+    def init_db(self):
+        try:
+            conn = psycopg2.connect(self.db_url)
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS evaluations_log (
+                    id SERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    tier VARCHAR(30),
+                    strategy VARCHAR(50),
+                    direction VARCHAR(10),
+                    score FLOAT,
+                    rsi FLOAT,
+                    btc_trend VARCHAR(10),
+                    decision VARCHAR(30),
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.info("Tabela evaluations_log inicializada.")
+        except Exception as e:
+            logger.error(f"Erro ao inicializar banco para evaluations_log: {e}")
+
+    def get_adjusted_thresholds(self, symbol, direction, btc_trend):
+        """
+        Calcula limite de score ajustado com base no histórico de perdas neste regime.
+        """
+        min_score = SHORT_MIN_SCORE if direction == "SHORT" else MIN_CONFIDENCE_SCORE
+        
+        try:
+            # Garante conexão ativa
+            if self.db_conn is None or self.db_conn.closed != 0:
+                self.db_conn = psycopg2.connect(self.db_url)
+                self.db_conn.autocommit = True
+                self.db_cursor = self.db_conn.cursor()
+                
+            self.db_cursor.execute("""
+                SELECT pnl_pct, exit_reason FROM trade_log
+                WHERE symbol = %s AND market_regime = %s AND status = 'CLOSED'
+                ORDER BY updated_at DESC LIMIT 5
+            """, (symbol, btc_trend))
+            rows = self.db_cursor.fetchall()
+            
+            if rows:
+                pnl_list = [float(r[0]) if r[0] is not None else 0.0 for r in rows]
+                avg_pnl = sum(pnl_list) / len(pnl_list)
+                losses = sum(1 for pnl in pnl_list if pnl < 0)
+                win_rate = (len(pnl_list) - losses) / len(pnl_list)
+                
+                # Se média de PnL for negativa ou WR < 40%, aplica penalidade
+                if avg_pnl < -0.5 or win_rate < 0.40:
+                    penalty = 0.10 if direction == "LONG" else 0.05
+                    min_score += penalty
+                    logger.info(f"  [RISK PENALTY] {symbol} no regime {btc_trend}: avg_pnl={avg_pnl:.2f}%, WR={win_rate:.0%} → Score mínimo ajustado para {min_score:.2f}")
+        except Exception as e:
+            logger.error(f"Erro ao calcular limite ajustado para {symbol}: {e}")
+            self.db_conn = None
+            self.db_cursor = None
+            
+        return min(min_score, 0.95)
+
+    def log_evaluation(self, symbol, tier, strategy, direction, score, rsi, btc_trend, decision):
+        try:
+            if self.db_conn is None or self.db_conn.closed != 0:
+                self.db_conn = psycopg2.connect(self.db_url)
+                self.db_conn.autocommit = True
+                self.db_cursor = self.db_conn.cursor()
+                
+            self.db_cursor.execute("""
+                INSERT INTO evaluations_log (symbol, tier, strategy, direction, score, rsi, btc_trend, decision)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (symbol, tier, strategy, direction, score, rsi, btc_trend, decision))
+            self.db_conn.commit()
+        except Exception as e:
+            logger.error(f"Erro ao salvar log de avaliacao no banco: {e}")
+            self.db_conn = None
+            self.db_cursor = None
 
     async def connect_nats(self):
         self.nc = await nats.connect(NATS_URL)
@@ -88,23 +172,42 @@ class DecisionEngine:
                     score = strat["score"]
                     direction = strat.get("direction", "LONG")
 
-                    # Filtro de regime: BTC trend bloqueia direção contrária
+                    # 1. Filtro de regime lateral: btc_trend == "neutral" bloqueia tudo
+                    if btc_trend == "neutral":
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_LATERAL")
+                        continue
+
+                    # 2. Filtro de regime: BTC trend bloqueia direção contrária
                     if btc_trend == "bull" and direction == "SHORT":
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_REGIME")
                         continue
                     if btc_trend == "bear" and direction == "LONG":
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_REGIME")
+                        continue
+
+                    # 3. Calcula o limite de score ajustado com base na penalidade de risco
+                    min_score_required = self.get_adjusted_thresholds(symbol, direction, btc_trend)
+
+                    default_min_score = SHORT_MIN_SCORE if direction == "SHORT" else MIN_CONFIDENCE_SCORE
+                    if score < default_min_score:
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_SCORE")
+                        continue
+                    
+                    if score < min_score_required:
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_PENALTY")
+                        continue
+
+                    # 4. Filtro de RSI
+                    rsi = await self.fetch_rsi(symbol)
+                    if rsi is None:
+                        logger.warning(f"  {symbol}: sem dados RSI")
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_NO_DATA")
                         continue
 
                     if direction == "SHORT":
-                        if score < SHORT_MIN_SCORE:
-                            continue
-
-                        rsi = await self.fetch_rsi(symbol)
-                        if rsi is None:
-                            logger.warning(f"  {symbol}: sem dados RSI para SHORT")
-                            continue
-
                         if rsi < SHORT_MIN_RSI:
                             logger.info(f"  {symbol}: short_score={score:.4f} ok, mas RSI={rsi:.1f} < {SHORT_MIN_RSI} → ignora")
+                            self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi, btc_trend, "REJECTED_RSI")
                             continue
 
                         logger.info(f"  {symbol}: SIGNAL SHORT → score={score:.4f} RSI={rsi:.1f} >= {SHORT_MIN_RSI}")
@@ -115,19 +218,14 @@ class DecisionEngine:
                             "score": score,
                             "rsi": round(rsi, 1),
                             "direction": "SHORT",
+                            "market_regime": btc_trend,
                             "timestamp": ev.get("timestamp", ""),
                         })
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi, btc_trend, "ACCEPTED")
                     else:
-                        if score < MIN_CONFIDENCE_SCORE:
-                            continue
-
-                        rsi = await self.fetch_rsi(symbol)
-                        if rsi is None:
-                            logger.warning(f"  {symbol}: sem dados RSI")
-                            continue
-
                         if rsi >= MAX_RSI_ENTRY:
                             logger.info(f"  {symbol}: score={score:.4f} ok, mas RSI={rsi:.1f} >= {MAX_RSI_ENTRY} → ignora")
+                            self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi, btc_trend, "REJECTED_RSI")
                             continue
 
                         logger.info(f"  {symbol}: SIGNAL LONG → score={score:.4f} RSI={rsi:.1f} < {MAX_RSI_ENTRY}")
@@ -138,8 +236,10 @@ class DecisionEngine:
                             "score": score,
                             "rsi": round(rsi, 1),
                             "direction": "LONG",
+                            "market_regime": btc_trend,
                             "timestamp": ev.get("timestamp", ""),
                         })
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi, btc_trend, "ACCEPTED")
 
             if opportunities:
                 payload = json.dumps(opportunities).encode()
@@ -152,6 +252,7 @@ class DecisionEngine:
 
     async def run(self):
         await self.connect_nats()
+        self.init_db()
         await self.js.subscribe("strategies.evaluated", durable="DECISION_ENGINE_WORKER",
                                  cb=self.process_evaluations, manual_ack=True,
                                  config=ConsumerConfig(ack_wait=30))

@@ -1,4 +1,5 @@
-﻿nats-py
+nats-py
 ccxt
 numpy
 pandas
+psycopg2-binary
