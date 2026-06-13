@@ -22,6 +22,8 @@ SHORT_MIN_SCORE = float(os.getenv("SHORT_MIN_SCORE", "0.85"))
 SHORT_MIN_RSI = float(os.getenv("SHORT_MIN_RSI", "65"))
 RSI_PERIOD = 56
 BTC_SMA_PERIOD = int(os.getenv("BTC_SMA_PERIOD", "12"))
+SHORT_ALLOWED_REGIMES = [r.strip().lower() for r in os.getenv("SHORT_ALLOWED_REGIMES", "bear,neutral").split(",") if r.strip()]
+LONG_ALLOWED_REGIMES = [r.strip().lower() for r in os.getenv("LONG_ALLOWED_REGIMES", "bull").split(",") if r.strip()]
 
 
 class DecisionEngine:
@@ -95,6 +97,59 @@ class DecisionEngine:
             self.db_cursor = None
             
         return min(min_score, 0.95)
+
+    def is_in_cooldown(self, symbol):
+        """
+        Verifica se o ativo está em cooldown progressivo devido a Stop Losses recentes.
+        """
+        cooldown_base = float(os.getenv("COOLDOWN_HOURS", "2.0"))
+        if cooldown_base <= 0:
+            return False
+            
+        try:
+            import time
+            if self.db_conn is None or self.db_conn.closed != 0:
+                self.db_conn = psycopg2.connect(self.db_url)
+                self.db_conn.autocommit = True
+                self.db_cursor = self.db_conn.cursor()
+                
+            self.db_cursor.execute("""
+                SELECT pnl_pct, EXTRACT(EPOCH FROM updated_at), exit_reason FROM trade_log
+                WHERE symbol = %s AND status = 'CLOSED'
+                ORDER BY updated_at DESC LIMIT 10
+            """, (symbol,))
+            rows = self.db_cursor.fetchall()
+            
+            if rows:
+                consecutive_losses = 0
+                last_exit_ts = None
+                for r in rows:
+                    pnl = float(r[0]) if r[0] is not None else 0.0
+                    ts = float(r[1]) if r[1] is not None else 0.0
+                    reason = r[2]
+                    
+                    if last_exit_ts is None:
+                        last_exit_ts = ts
+                        
+                    if pnl < 0 or reason == 'STOP_LOSS':
+                        consecutive_losses += 1
+                    else:
+                        break
+                        
+                if consecutive_losses > 0 and last_exit_ts is not None:
+                    cooldown_h = cooldown_base * (2.0 ** (consecutive_losses - 1))
+                    cooldown_h = min(cooldown_h, 48.0)
+                    
+                    elapsed = time.time() - last_exit_ts
+                    if elapsed < cooldown_h * 3600:
+                        logger.info(f"  [COOLDOWN] {symbol}: ativo após {consecutive_losses} loss(es) ({elapsed/3600:.1f}h < {cooldown_h:.1f}h)")
+                        return True
+        except Exception as e:
+            logger.error(f"Erro ao verificar cooldown para {symbol}: {e}")
+            self.db_conn = None
+            self.db_cursor = None
+            
+        return False
 
     def log_evaluation(self, symbol, tier, strategy, direction, score, rsi, btc_trend, decision):
         try:
@@ -172,17 +227,20 @@ class DecisionEngine:
                     score = strat["score"]
                     direction = strat.get("direction", "LONG")
 
-                    # 1. Filtro de regime lateral: btc_trend == "neutral" bloqueia LONGs
-                    if btc_trend == "neutral" and direction == "LONG":
-                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_LATERAL")
+                    # 1. Filtro de regime: verifica se a direção é permitida no regime atual do BTC
+                    if direction == "LONG" and btc_trend not in LONG_ALLOWED_REGIMES:
+                        dec_reason = "REJECTED_LATERAL" if btc_trend == "neutral" else "REJECTED_REGIME"
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, dec_reason)
                         continue
 
-                    # 2. Filtro de regime: BTC trend bloqueia direção contrária
-                    if btc_trend == "bull" and direction == "SHORT":
-                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_REGIME")
+                    if direction == "SHORT" and btc_trend not in SHORT_ALLOWED_REGIMES:
+                        dec_reason = "REJECTED_LATERAL" if btc_trend == "neutral" else "REJECTED_REGIME"
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, dec_reason)
                         continue
-                    if btc_trend == "bear" and direction == "LONG":
-                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_REGIME")
+
+                    # 2. Filtro de Cooldown progressivo de Stop Loss
+                    if self.is_in_cooldown(symbol):
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_COOLDOWN")
                         continue
 
                     # 3. Calcula o limite de score ajustado com base na penalidade de risco
