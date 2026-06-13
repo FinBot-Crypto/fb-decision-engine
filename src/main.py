@@ -172,8 +172,8 @@ class DecisionEngine:
                     score = strat["score"]
                     direction = strat.get("direction", "LONG")
 
-                    # 1. Filtro de regime lateral: btc_trend == "neutral" bloqueia tudo
-                    if btc_trend == "neutral":
+                    # 1. Filtro de regime lateral: btc_trend == "neutral" bloqueia LONGs
+                    if btc_trend == "neutral" and direction == "LONG":
                         self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_LATERAL")
                         continue
 
