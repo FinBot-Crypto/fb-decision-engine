@@ -10,6 +10,7 @@ Fluxo:
 """
 import asyncio, logging, os, json, numpy as np, ccxt, nats, psycopg2
 from nats.js.api import ConsumerConfig
+from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("fb-decision-engine")
@@ -26,6 +27,7 @@ SHORT_ALLOWED_REGIMES = [r.strip().lower() for r in os.getenv("SHORT_ALLOWED_REG
 LONG_ALLOWED_REGIMES = [r.strip().lower() for r in os.getenv("LONG_ALLOWED_REGIMES", "bull").split(",") if r.strip()]
 SHORT_ALLOWED_TIERS = [t.strip() for t in os.getenv("SHORT_ALLOWED_TIERS", "Major,Strong Alt,High Volatility").split(",") if t.strip()]
 LONG_ALLOWED_TIERS = [t.strip() for t in os.getenv("LONG_ALLOWED_TIERS", "Major,Strong Alt,High Volatility").split(",") if t.strip()]
+SHORT_ALLOWED_HOURS = [int(h.strip()) for h in os.getenv("SHORT_ALLOWED_HOURS", "11,12,13,14,15,16,17").split(",") if h.strip()]
 
 
 class DecisionEngine:
@@ -247,6 +249,11 @@ class DecisionEngine:
 
                     if direction == "SHORT" and tier not in SHORT_ALLOWED_TIERS:
                         self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_TIER")
+                        continue
+
+                    # 1.6 Filtro de Horário para SHORT (de acordo com shadow)
+                    if direction == "SHORT" and datetime.now(timezone.utc).hour not in SHORT_ALLOWED_HOURS:
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_HOURS")
                         continue
 
                     # 2. Filtro de Cooldown progressivo de Stop Loss
