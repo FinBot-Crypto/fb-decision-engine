@@ -24,6 +24,8 @@ RSI_PERIOD = 56
 BTC_SMA_PERIOD = int(os.getenv("BTC_SMA_PERIOD", "12"))
 SHORT_ALLOWED_REGIMES = [r.strip().lower() for r in os.getenv("SHORT_ALLOWED_REGIMES", "bear,neutral").split(",") if r.strip()]
 LONG_ALLOWED_REGIMES = [r.strip().lower() for r in os.getenv("LONG_ALLOWED_REGIMES", "bull").split(",") if r.strip()]
+SHORT_ALLOWED_TIERS = [t.strip() for t in os.getenv("SHORT_ALLOWED_TIERS", "Major,Strong Alt,High Volatility").split(",") if t.strip()]
+LONG_ALLOWED_TIERS = [t.strip() for t in os.getenv("LONG_ALLOWED_TIERS", "Major,Strong Alt,High Volatility").split(",") if t.strip()]
 
 
 class DecisionEngine:
@@ -236,6 +238,15 @@ class DecisionEngine:
                     if direction == "SHORT" and btc_trend not in SHORT_ALLOWED_REGIMES:
                         dec_reason = "REJECTED_LATERAL" if btc_trend == "neutral" else "REJECTED_REGIME"
                         self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, dec_reason)
+                        continue
+
+                    # 1.5 Filtro de Tier
+                    if direction == "LONG" and tier not in LONG_ALLOWED_TIERS:
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_TIER")
+                        continue
+
+                    if direction == "SHORT" and tier not in SHORT_ALLOWED_TIERS:
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_TIER")
                         continue
 
                     # 2. Filtro de Cooldown progressivo de Stop Loss
