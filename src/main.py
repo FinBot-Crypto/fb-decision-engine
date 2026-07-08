@@ -177,26 +177,31 @@ class DecisionEngine:
         self.js = self.nc.jetstream()
         logger.info(f"NATS conectado: {NATS_URL}")
 
-    def compute_rsi(self, closes):
+    def compute_rsi_smooth(self, closes):
         import pandas as pd
         delta = np.diff(closes)
         gain = np.maximum(delta, 0)
         loss = -np.minimum(delta, 0)
         avg_gain = pd.Series(gain).rolling(RSI_PERIOD).mean().values
         avg_loss = pd.Series(loss).rolling(RSI_PERIOD).mean().values
-        rsi = 100 - 100 / (1 + avg_gain / (avg_loss + 1e-10))
-        return float(rsi[-1])
+        rsi_14 = 100 - 100 / (1 + avg_gain / (avg_loss + 1e-10))
+        rsi_smooth = pd.Series(rsi_14).ewm(span=2, adjust=False).mean().values
+        return float(rsi_smooth[-1]), float(rsi_14[-1])
 
-    async def fetch_rsi(self, symbol):
+    async def fetch_rsi_smooth(self, symbol):
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, "15m", limit=200)
             closes = [c[4] for c in ohlcv]
             if len(closes) < RSI_PERIOD + 1:
-                return None
-            return self.compute_rsi(closes)
+                return None, None
+            return self.compute_rsi_smooth(closes)
         except Exception as e:
-            logger.error(f"Erro RSI {symbol}: {e}")
-            return None
+            logger.error(f"Erro RSI smooth {symbol}: {e}")
+            return None, None
+
+    async def fetch_rsi(self, symbol):
+        _, rsi_raw = await self.fetch_rsi_smooth(symbol)
+        return rsi_raw
 
     async def fetch_btc_trend(self):
         try:
@@ -251,10 +256,6 @@ class DecisionEngine:
                         self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_TIER")
                         continue
 
-                    # 1.6 Filtro de Horário para SHORT (de acordo com shadow)
-                    if direction == "SHORT" and datetime.now(timezone.utc).hour not in SHORT_ALLOWED_HOURS:
-                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_HOURS")
-                        continue
 
                     # 2. Filtro de Cooldown progressivo de Stop Loss
                     if self.is_in_cooldown(symbol):
@@ -273,49 +274,49 @@ class DecisionEngine:
                         self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_PENALTY")
                         continue
 
-                    # 4. Filtro de RSI
-                    rsi = await self.fetch_rsi(symbol)
-                    if rsi is None:
+                    # 4. Filtro de RSI (usando RSI_smooth)
+                    rsi_smooth, rsi_raw = await self.fetch_rsi_smooth(symbol)
+                    if rsi_smooth is None:
                         logger.warning(f"  {symbol}: sem dados RSI")
                         self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_NO_DATA")
                         continue
 
                     if direction == "SHORT":
-                        if rsi < SHORT_MIN_RSI:
-                            logger.info(f"  {symbol}: short_score={score:.4f} ok, mas RSI={rsi:.1f} < {SHORT_MIN_RSI} → ignora")
-                            self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi, btc_trend, "REJECTED_RSI")
+                        if rsi_smooth <= SHORT_MIN_RSI:
+                            logger.info(f"  {symbol}: short_score={score:.4f} ok, mas RSI_smooth={rsi_smooth:.1f} <= {SHORT_MIN_RSI} → ignora")
+                            self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi_smooth, btc_trend, "REJECTED_RSI")
                             continue
 
-                        logger.info(f"  {symbol}: SIGNAL SHORT → score={score:.4f} RSI={rsi:.1f} >= {SHORT_MIN_RSI}")
+                        logger.info(f"  {symbol}: SIGNAL SHORT → score={score:.4f} RSI_smooth={rsi_smooth:.1f} > {SHORT_MIN_RSI}")
                         opportunities.append({
                             "symbol": symbol,
                             "tier": tier,
                             "strategy": strat["name"],
                             "score": score,
-                            "rsi": round(rsi, 1),
+                            "rsi": round(rsi_smooth, 1),
                             "direction": "SHORT",
                             "market_regime": btc_trend,
                             "timestamp": ev.get("timestamp", ""),
                         })
-                        self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi, btc_trend, "ACCEPTED")
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi_smooth, btc_trend, "ACCEPTED")
                     else:
-                        if rsi >= MAX_RSI_ENTRY:
-                            logger.info(f"  {symbol}: score={score:.4f} ok, mas RSI={rsi:.1f} >= {MAX_RSI_ENTRY} → ignora")
-                            self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi, btc_trend, "REJECTED_RSI")
+                        if rsi_smooth >= MAX_RSI_ENTRY:
+                            logger.info(f"  {symbol}: score={score:.4f} ok, mas RSI_smooth={rsi_smooth:.1f} >= {MAX_RSI_ENTRY} → ignora")
+                            self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi_smooth, btc_trend, "REJECTED_RSI")
                             continue
 
-                        logger.info(f"  {symbol}: SIGNAL LONG → score={score:.4f} RSI={rsi:.1f} < {MAX_RSI_ENTRY}")
+                        logger.info(f"  {symbol}: SIGNAL LONG → score={score:.4f} RSI_smooth={rsi_smooth:.1f} < {MAX_RSI_ENTRY}")
                         opportunities.append({
                             "symbol": symbol,
                             "tier": tier,
                             "strategy": strat["name"],
                             "score": score,
-                            "rsi": round(rsi, 1),
+                            "rsi": round(rsi_smooth, 1),
                             "direction": "LONG",
                             "market_regime": btc_trend,
                             "timestamp": ev.get("timestamp", ""),
                         })
-                        self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi, btc_trend, "ACCEPTED")
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi_smooth, btc_trend, "ACCEPTED")
 
             if opportunities:
                 payload = json.dumps(opportunities).encode()
