@@ -67,40 +67,10 @@ class DecisionEngine:
     def get_adjusted_thresholds(self, symbol, direction, btc_trend):
         """
         Calcula limite de score ajustado com base no histórico de perdas neste regime.
+        Suspenso temporariamente conforme solicitação do usuário.
         """
         min_score = SHORT_MIN_SCORE if direction == "SHORT" else MIN_CONFIDENCE_SCORE
-        
-        try:
-            # Garante conexão ativa
-            if self.db_conn is None or self.db_conn.closed != 0:
-                self.db_conn = psycopg2.connect(self.db_url)
-                self.db_conn.autocommit = True
-                self.db_cursor = self.db_conn.cursor()
-                
-            self.db_cursor.execute("""
-                SELECT pnl_pct, exit_reason FROM trade_log
-                WHERE symbol = %s AND market_regime = %s AND status = 'CLOSED'
-                ORDER BY updated_at DESC LIMIT 5
-            """, (symbol, btc_trend))
-            rows = self.db_cursor.fetchall()
-            
-            if rows:
-                pnl_list = [float(r[0]) if r[0] is not None else 0.0 for r in rows]
-                avg_pnl = sum(pnl_list) / len(pnl_list)
-                losses = sum(1 for pnl in pnl_list if pnl < 0)
-                win_rate = (len(pnl_list) - losses) / len(pnl_list)
-                
-                # Se média de PnL for negativa ou WR < 40%, aplica penalidade
-                if avg_pnl < -0.5 or win_rate < 0.40:
-                    penalty = 0.10 if direction == "LONG" else 0.05
-                    min_score += penalty
-                    logger.info(f"  [RISK PENALTY] {symbol} no regime {btc_trend}: avg_pnl={avg_pnl:.2f}%, WR={win_rate:.0%} → Score mínimo ajustado para {min_score:.2f}")
-        except Exception as e:
-            logger.error(f"Erro ao calcular limite ajustado para {symbol}: {e}")
-            self.db_conn = None
-            self.db_cursor = None
-            
-        return min(min_score, 0.95)
+        return min_score
 
     def is_in_cooldown(self, symbol):
         """
