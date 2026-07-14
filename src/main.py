@@ -38,6 +38,32 @@ class DecisionEngine:
         self.db_url = DATABASE_URL
         self.db_conn = None
         self.db_cursor = None
+        self.settings = {}
+        self.last_settings_update = 0
+
+    def get_settings(self):
+        import time
+        now = time.time()
+        if now - self.last_settings_update > 30 or not self.settings:
+            try:
+                conn = psycopg2.connect(self.db_url)
+                cur = conn.cursor()
+                cur.execute("SELECT key, value FROM bot_settings")
+                rows = cur.fetchall()
+                cur.close()
+                conn.close()
+                for r in rows:
+                    val = r[1]
+                    if isinstance(val, str):
+                        try:
+                            val = json.loads(val)
+                        except:
+                            pass
+                    self.settings[r[0]] = val
+                self.last_settings_update = now
+                logger.info("Configurações do robô atualizadas do banco de dados.")
+            except Exception as e:
+                logger.error(f"Erro ao carregar configurações do banco no decision-engine: {e}")
 
     def init_db(self):
         try:
@@ -195,6 +221,7 @@ class DecisionEngine:
             evaluations = json.loads(msg.data.decode())
             btc_trend = await self.fetch_btc_trend()
             logger.info(f"Analisando {len(evaluations)} avaliações [BTC: {btc_trend}]")
+            self.get_settings()
             opportunities = []
 
             for ev in evaluations:
@@ -206,59 +233,30 @@ class DecisionEngine:
                     score = strat["score"]
                     direction = strat.get("direction", "LONG")
 
-                    # 1. Filtro de regime: verifica se a direção é permitida no regime atual do BTC
-                    if direction == "LONG" and btc_trend not in LONG_ALLOWED_REGIMES:
+                    # 1. Filtro de regime dinâmico configurado no banco por grupo/tier
+                    allowed_regimes_key = f"{direction.lower()}_{tier}_allowed_regimes"
+                    default_regimes = ["bull", "neutral"] if direction == "LONG" else ["bear", "neutral"]
+                    allowed_regimes = self.settings.get(allowed_regimes_key, default_regimes)
+                     
+                    if btc_trend not in allowed_regimes:
                         dec_reason = "REJECTED_LATERAL" if btc_trend == "neutral" else "REJECTED_REGIME"
                         self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, dec_reason)
                         continue
 
-                    if direction == "SHORT" and btc_trend not in SHORT_ALLOWED_REGIMES:
-                        dec_reason = "REJECTED_LATERAL" if btc_trend == "neutral" else "REJECTED_REGIME"
-                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, dec_reason)
+                    # 1.5 Filtro de Tier/Direção habilitada do Banco
+                    allowed_key = f"{direction.lower()}_{tier}_allowed"
+                    if not self.settings.get(allowed_key, True):
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_TIER_DISABLED")
                         continue
-
-                    # 1.5 Filtro de Tier
-                    if direction == "LONG" and tier not in LONG_ALLOWED_TIERS:
-                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_TIER")
-                        continue
-
-                    if direction == "SHORT" and tier not in SHORT_ALLOWED_TIERS:
-                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_TIER")
-                        continue
-
 
                     # 2. Filtro de Cooldown progressivo de Stop Loss
                     if self.is_in_cooldown(symbol):
                         self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_COOLDOWN")
                         continue
 
-                    # 3. Calcula o limite de score e rsi com base no Tier e Direção (Otimizado)
-                    if direction == "SHORT":
-                        if tier == "Major":
-                            min_score_required = 0.70
-                            min_rsi_required = 70.0
-                        elif tier == "Strong Alt":
-                            min_score_required = 0.75
-                            min_rsi_required = 70.0
-                        elif tier == "High Volatility":
-                            min_score_required = 0.85
-                            min_rsi_required = 75.0
-                        else:
-                            min_score_required = SHORT_MIN_SCORE
-                            min_rsi_required = SHORT_MIN_RSI
-                    else:  # LONG
-                        if tier == "Major":
-                            min_score_required = 0.70
-                            max_rsi_required = 30.0
-                        elif tier == "Strong Alt":
-                            min_score_required = 0.73
-                            max_rsi_required = 30.0
-                        elif tier == "High Volatility":
-                            min_score_required = 0.75
-                            max_rsi_required = 25.0
-                        else:
-                            min_score_required = MIN_CONFIDENCE_SCORE
-                            max_rsi_required = MAX_RSI_ENTRY
+                    # 3. Calcula o limite de score e rsi com base no Tier e Direção (Otimizado do Banco)
+                    min_score_key = f"{direction.lower()}_{tier}_min_score"
+                    min_score_required = float(self.settings.get(min_score_key, 0.70))
 
                     if score < min_score_required:
                         self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_SCORE")
@@ -272,6 +270,8 @@ class DecisionEngine:
                         continue
 
                     if direction == "SHORT":
+                        min_rsi_key = f"short_{tier}_min_rsi"
+                        min_rsi_required = float(self.settings.get(min_rsi_key, 70.0))
                         if rsi_smooth < min_rsi_required:
                             logger.info(f"  {symbol}: short_score={score:.4f} ok, mas RSI_smooth={rsi_smooth:.1f} < {min_rsi_required} → ignora")
                             self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi_smooth, btc_trend, "REJECTED_RSI")
@@ -290,6 +290,8 @@ class DecisionEngine:
                         })
                         self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi_smooth, btc_trend, "ACCEPTED")
                     else:
+                        max_rsi_key = f"long_{tier}_max_rsi"
+                        max_rsi_required = float(self.settings.get(max_rsi_key, 30.0))
                         if rsi_smooth > max_rsi_required:
                             logger.info(f"  {symbol}: score={score:.4f} ok, mas RSI_smooth={rsi_smooth:.1f} > {max_rsi_required} → ignora")
                             self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi_smooth, btc_trend, "REJECTED_RSI")
