@@ -232,16 +232,36 @@ class DecisionEngine:
                         self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_COOLDOWN")
                         continue
 
-                    # 3. Calcula o limite de score ajustado com base na penalidade de risco
-                    min_score_required = self.get_adjusted_thresholds(symbol, direction, btc_trend)
+                    # 3. Calcula o limite de score e rsi com base no Tier e Direção (Otimizado)
+                    if direction == "SHORT":
+                        if tier == "Major":
+                            min_score_required = 0.70
+                            min_rsi_required = 70.0
+                        elif tier == "Strong Alt":
+                            min_score_required = 0.75
+                            min_rsi_required = 70.0
+                        elif tier == "High Volatility":
+                            min_score_required = 0.85
+                            min_rsi_required = 75.0
+                        else:
+                            min_score_required = SHORT_MIN_SCORE
+                            min_rsi_required = SHORT_MIN_RSI
+                    else:  # LONG
+                        if tier == "Major":
+                            min_score_required = 0.70
+                            max_rsi_required = 30.0
+                        elif tier == "Strong Alt":
+                            min_score_required = 0.73
+                            max_rsi_required = 30.0
+                        elif tier == "High Volatility":
+                            min_score_required = 0.75
+                            max_rsi_required = 25.0
+                        else:
+                            min_score_required = MIN_CONFIDENCE_SCORE
+                            max_rsi_required = MAX_RSI_ENTRY
 
-                    default_min_score = SHORT_MIN_SCORE if direction == "SHORT" else MIN_CONFIDENCE_SCORE
-                    if score < default_min_score:
-                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_SCORE")
-                        continue
-                    
                     if score < min_score_required:
-                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_PENALTY")
+                        self.log_evaluation(symbol, tier, strat["name"], direction, score, None, btc_trend, "REJECTED_SCORE")
                         continue
 
                     # 4. Filtro de RSI (usando RSI_smooth)
@@ -252,12 +272,12 @@ class DecisionEngine:
                         continue
 
                     if direction == "SHORT":
-                        if rsi_smooth <= SHORT_MIN_RSI:
-                            logger.info(f"  {symbol}: short_score={score:.4f} ok, mas RSI_smooth={rsi_smooth:.1f} <= {SHORT_MIN_RSI} → ignora")
+                        if rsi_smooth < min_rsi_required:
+                            logger.info(f"  {symbol}: short_score={score:.4f} ok, mas RSI_smooth={rsi_smooth:.1f} < {min_rsi_required} → ignora")
                             self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi_smooth, btc_trend, "REJECTED_RSI")
                             continue
 
-                        logger.info(f"  {symbol}: SIGNAL SHORT → score={score:.4f} RSI_smooth={rsi_smooth:.1f} > {SHORT_MIN_RSI}")
+                        logger.info(f"  {symbol}: SIGNAL SHORT → score={score:.4f} RSI_smooth={rsi_smooth:.1f} >= {min_rsi_required}")
                         opportunities.append({
                             "symbol": symbol,
                             "tier": tier,
@@ -270,12 +290,12 @@ class DecisionEngine:
                         })
                         self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi_smooth, btc_trend, "ACCEPTED")
                     else:
-                        if rsi_smooth >= MAX_RSI_ENTRY:
-                            logger.info(f"  {symbol}: score={score:.4f} ok, mas RSI_smooth={rsi_smooth:.1f} >= {MAX_RSI_ENTRY} → ignora")
+                        if rsi_smooth > max_rsi_required:
+                            logger.info(f"  {symbol}: score={score:.4f} ok, mas RSI_smooth={rsi_smooth:.1f} > {max_rsi_required} → ignora")
                             self.log_evaluation(symbol, tier, strat["name"], direction, score, rsi_smooth, btc_trend, "REJECTED_RSI")
                             continue
 
-                        logger.info(f"  {symbol}: SIGNAL LONG → score={score:.4f} RSI_smooth={rsi_smooth:.1f} < {MAX_RSI_ENTRY}")
+                        logger.info(f"  {symbol}: SIGNAL LONG → score={score:.4f} RSI_smooth={rsi_smooth:.1f} <= {max_rsi_required}")
                         opportunities.append({
                             "symbol": symbol,
                             "tier": tier,
